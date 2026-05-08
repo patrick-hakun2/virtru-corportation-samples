@@ -139,16 +139,36 @@ services:
 #================================================================
 # Start Trino
 #----------------------------------------------------------------
-  binfmt:
-    image: tonistiigi/binfmt
-    privileged: true
-    command: --install all
-    restart: "no"
+  # binfmt no longer needed — Trino image is now linux/amd64 (native on x86_64 host)
+  # binfmt:
+  #   image: tonistiigi/binfmt
+  #   privileged: true
+  #   command: --install all
+  #   restart: "no"
 
-  tdf-trino:
+  tdf-trino-coordinator:
     extends:
       file: ./compose/docker-compose.trino.yaml
-      service: tdf-trino
-    depends_on:
-      binfmt:
-        condition: service_completed_successfully
+      service: tdf-trino-coordinator
+    # depends_on:
+    #   binfmt:
+    #     condition: service_completed_successfully
+
+  # Workers disabled: tdf-trino v0.6.0 (479) reads the JWT from ConnectorIdentity on workers,
+  # but Trino only propagates the principal name (not the JWTAwarePrincipalRecord) across
+  # the wire. Single-node mode (coordinator-only) keeps the JWTAwarePrincipal in-process.
+  # tdf-trino-worker-1:
+  #   extends:
+  #     file: ./compose/docker-compose.trino.yaml
+  #     service: tdf-trino-worker-1
+  #   depends_on:
+  #     tdf-trino-coordinator:
+  #       condition: service_started
+
+  # tdf-trino-worker-2:
+  #   extends:
+  #     file: ./compose/docker-compose.trino.yaml
+  #     service: tdf-trino-worker-2
+  #   depends_on:
+  #     tdf-trino-coordinator:
+  #       condition: service_started

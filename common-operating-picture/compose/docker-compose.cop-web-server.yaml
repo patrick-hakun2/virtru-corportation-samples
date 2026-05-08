@@ -18,6 +18,7 @@ services:
       VITE_DSP_KC_CLIENT_ID: dsp-cop-client
       VITE_DSP_KC_DIRECT_AUTH: false
       VITE_FORM_SUBMIT_NANO_TDF: true
+      DSP_COP_DATA_SOURCE_TRINO_POLICY_SIGNING_SECRET: ${DSP_COP_DATA_SOURCE_TRINO_POLICY_SIGNING_SECRET}
     volumes:
       - ../config.yaml:/etc/dsp-cop/config.yaml
       - ../dsp-keys/rootCA.pem:/etc/ssl/certs/ca-certificates.crt

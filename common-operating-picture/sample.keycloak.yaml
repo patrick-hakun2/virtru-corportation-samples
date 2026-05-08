@@ -1,5 +1,6 @@
 baseUrl: &baseUrl https://local-dsp.virtru.com:8443
 serverBaseUrl: &serverBaseUrl https://local-dsp.virtru.com:8080
+grpcEndpoint: &grpcEndpoint local-dsp.virtru.com:8080
 customAudMapper: &customAudMapper
   name: audience-mapper
   protocol: openid-connect
@@ -8,6 +9,22 @@ customAudMapper: &customAudMapper
     included.client.audience: *serverBaseUrl
     access.token.claim: 'true'
     id.token.claim: 'true'
+grpcAudMapper: &grpcAudMapper
+  name: grpc-audience-mapper
+  protocol: openid-connect
+  protocolMapper: oidc-audience-mapper
+  config:
+    included.client.audience: *grpcEndpoint
+    access.token.claim: 'true'
+    id.token.claim: 'true'
+opentdfSdkAudMapper: &opentdfSdkAudMapper
+  name: opentdf-sdk-audience-mapper
+  protocol: openid-connect
+  protocolMapper: oidc-audience-mapper
+  config:
+    included.client.audience: opentdf-sdk
+    access.token.claim: 'true'
+    id.token.claim: 'false'
 realms:
   - realm_repepresentation:
       realm: opentdf
@@ -64,6 +81,7 @@ realms:
           secret: secret
           protocolMappers:
             - *customAudMapper
+            - *grpcAudMapper
         sa_realm_roles:
           - opentdf-org-admin
       - client:
@@ -75,6 +93,7 @@ realms:
           secret: secret
           protocolMappers:
             - *customAudMapper
+            - *grpcAudMapper
         sa_realm_roles:
           - opentdf-standard
       - client:
@@ -126,6 +145,7 @@ realms:
             - '*'
           protocolMappers:
             - *customAudMapper
+            - *opentdfSdkAudMapper
             - name: secure-object-proxy-audience-mapper
               protocol: openid-connect
               protocolMapper: oidc-audience-mapper

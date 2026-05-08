@@ -1,6 +1,8 @@
 import os
 import uuid
 import json
+import hmac
+import hashlib
 import random
 import psycopg2
 import argparse
@@ -18,6 +20,48 @@ from botocore.config import Config
 
 # --- Suppress SSL Warnings for local dev ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+def _to_str_list(val):
+    if isinstance(val, list):
+        return [v for v in val if isinstance(v, str)]
+    if isinstance(val, str) and val:
+        return [val]
+    return []
+
+
+def build_tdf_policy(search_json: str, secret: str) -> str:
+    """Mirrors Go's buildTdfPolicy: builds and HMAC-signs the row-level TDF policy."""
+    default_policy = []
+    tdf_policies = []
+
+    if search_json and search_json != "null":
+        try:
+            m = json.loads(search_json)
+            default_policy = sorted(
+                _to_str_list(m.get("attrClassification")) +
+                _to_str_list(m.get("attrNeedToKnow"))
+            )
+            tdf_policies = sorted(
+                [[r] for r in _to_str_list(m.get("attrRelTo"))],
+                key=lambda x: x[0] if x else ""
+            )
+        except Exception:
+            pass
+
+    # Key order must match Go struct: tdf_policies first, default_policy second.
+    canonical = json.dumps(
+        {"tdf_policies": tdf_policies, "default_policy": default_policy},
+        separators=(",", ":")
+    )
+    tag = base64.b64encode(
+        hmac.new(secret.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).digest()
+    ).decode("utf-8")
+
+    return json.dumps(
+        {"tdf_policies": tdf_policies, "default_policy": default_policy, "policy_tag": tag},
+        separators=(",", ":")
+    )
 
 # --- User/Auth Configs ---
 KEYCLOAK_URL = os.getenv("KEYCLOAK_URL", "https://local-dsp.virtru.com:8443/auth")
@@ -80,6 +124,9 @@ SECURITY_CAVEATS = ["NOFORN", "FVEY", "REL TO USA", "ORCON", "PROPIN", "REL TO N
 SENSOR_TYPES = ["SAR", "EO/IR", "MTI", "GMTI", "ESM", "COMMS", "RADAR", "LIDAR"]
 EMISSION_CONTROL = ["EMCON ALPHA", "EMCON BRAVO", "EMCON CHARLIE", "EMCON DELTA"]
 
+# Must match tdf.policy-signing-secret in compose/trino-config/catalog/tdf_postgresql.properties
+POLICY_SIGNING_SECRET = os.getenv("DSP_COP_DATA_SOURCE_TRINO_POLICY_SIGNING_SECRET")
+
 # --- SQL Queries ---
 DELETE_SQL = "DELETE FROM tdf_objects"
 INSERT_SQL = """
@@ -92,10 +139,11 @@ INSERT INTO tdf_objects (
     metadata,
     tdf_blob,
     tdf_uri,
+    tdf_policy,
     _created_at,
     _created_by
 )
-VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 """
 
 
@@ -370,6 +418,7 @@ def generate_tdf_records(count, sdk):
         random_geo = generate_random_point_wkb()
         random_created_at = random_ts + timedelta(seconds=random.uniform(0.01, 0.1))
 
+        tdf_policy = build_tdf_policy(search_jsonb, POLICY_SIGNING_SECRET)
         record = (
             random_id,
             random_ts,
@@ -379,6 +428,7 @@ def generate_tdf_records(count, sdk):
             metadata_jsonb,
             tdf_blob,
             FIXED_TDF_URI,
+            tdf_policy,
             random_created_at,
             FIXED_CREATED_BY
         )

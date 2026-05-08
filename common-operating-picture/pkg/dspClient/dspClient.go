@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/opentdf/platform/protocol/go/authorization"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -13,8 +14,9 @@ import (
 type Entitlements map[string]bool
 
 func GetEntitlements(endpoint string, token string) (Entitlements, error) {
+	rawToken := strings.TrimPrefix(token, "Bearer ")
 	body := []byte(`{
-		"token": "` + token + `"
+		"token": "` + rawToken + `"
 	}`)
 
 	// Create a new request using http
@@ -24,8 +26,7 @@ func GetEntitlements(endpoint string, token string) (Entitlements, error) {
 	}
 
 	// add authorization header and content-type to the req
-	authHeaderString := "Bearer " + token
-	req.Header.Add("Authorization", authHeaderString)
+	req.Header.Add("Authorization", "Bearer "+rawToken)
 	req.Header.Add("Content-Type", "application/json")
 	
 	//send request

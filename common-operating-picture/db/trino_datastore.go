@@ -2,11 +2,14 @@ package db
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -30,11 +33,12 @@ import (
 // Writes (INSERT / UPDATE / DELETE) are also sent through Trino; the
 // tdf_postgresql connector pushes them down to PostgreSQL.
 type TrinoDataStore struct {
-	db          *sql.DB
-	serverURI   string // base URI, e.g. https://admin@host:8443
-	catalog     string
-	schema      string
-	sslCertPath string // PEM CA cert path for HTTPS (empty = system pool)
+	db           *sql.DB
+	serverURI    string // base URI, e.g. https://admin@host:8443
+	catalog      string
+	plainCatalog string // plain postgresql catalog (no TDF interception) for tdf_blob reads
+	schema       string
+	sslCertPath  string // PEM CA cert path for HTTPS (empty = system pool)
 
 	// fallbackToken is a service-account JWT used when no user token is in context.
 	// The TDF connector requires a JWT on every table access, so server-initiated
@@ -42,10 +46,17 @@ type TrinoDataStore struct {
 	fallbackMu    sync.RWMutex
 	fallbackToken string
 
+	// signingSecret is the HMAC-SHA256 key used to sign tdf_policy rows on insert.
+	// Must match tdf.policy-signing-secret in the Trino catalog properties file.
+	signingSecret string
+
 	// userDBs caches one sql.DB per access token so we don't open a new
-	// Trino session (and Postgres connection) on every query.
+	// Trino session (and Postgres connection) on every query. Each entry is
+	// paired with its expiry time so expired connections are closed and evicted
+	// rather than leaking indefinitely.
 	userDBsMu sync.Mutex
 	userDBs   map[string]*sql.DB
+	userDBExp map[string]time.Time
 }
 
 // SetFallbackToken updates the service-account JWT used for queries that have
@@ -77,6 +88,10 @@ func NewTrinoDataStore(cfg config.TrinoConfig) (*TrinoDataStore, error) {
 		Catalog:     cfg.Catalog,
 		Schema:      cfg.Schema,
 		SSLCertPath: cfg.SSLCertPath,
+		// Placeholder so the startup ping query has a non-empty extra-credential
+		// map. The Virtru agent's SessionRepresentationDelegate blindly accesses
+		// values()[0]; an empty map causes AIOOBE in the Trino web UI query list.
+		ExtraCredentials: map[string]string{"jwt": "n/a"},
 	}
 	baseDSN, err := baseCfg.FormatDSN()
 	if err != nil {
@@ -105,12 +120,15 @@ func NewTrinoDataStore(cfg config.TrinoConfig) (*TrinoDataStore, error) {
 	)
 
 	return &TrinoDataStore{
-		db:          db,
-		serverURI:   serverURI,
-		catalog:     cfg.Catalog,
-		schema:      cfg.Schema,
-		sslCertPath: cfg.SSLCertPath,
-		userDBs:     make(map[string]*sql.DB),
+		db:            db,
+		serverURI:     serverURI,
+		catalog:       cfg.Catalog,
+		plainCatalog:  "postgresql",
+		schema:        cfg.Schema,
+		sslCertPath:   cfg.SSLCertPath,
+		signingSecret: cfg.PolicySigningSecret,
+		userDBs:       make(map[string]*sql.DB),
+		userDBExp:     make(map[string]time.Time),
 	}, nil
 }
 
@@ -121,8 +139,42 @@ func (s *TrinoDataStore) Close() error {
 		db.Close()
 	}
 	s.userDBs = make(map[string]*sql.DB)
+	s.userDBExp = make(map[string]time.Time)
 	s.userDBsMu.Unlock()
 	return s.db.Close()
+}
+
+// evictExpiredDBs closes and removes cached user DBs whose JWT has expired.
+// Must be called with s.userDBsMu held.
+func (s *TrinoDataStore) evictExpiredDBs() {
+	now := time.Now()
+	for token, exp := range s.userDBExp {
+		if now.After(exp) {
+			s.userDBs[token].Close()
+			delete(s.userDBs, token)
+			delete(s.userDBExp, token)
+		}
+	}
+}
+
+// jwtExpiry decodes the JWT exp claim without verifying the signature.
+// Returns a zero time on any parse error (treated as already expired).
+func jwtExpiry(token string) time.Time {
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return time.Time{}
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return time.Time{}
+	}
+	var claims struct {
+		Exp int64 `json:"exp"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil || claims.Exp == 0 {
+		return time.Time{}
+	}
+	return time.Unix(claims.Exp, 0)
 }
 
 // jwtPreferredUsername decodes the JWT payload (without signature verification —
@@ -180,6 +232,7 @@ func (s *TrinoDataStore) dbForCtx(ctx context.Context) (db *sql.DB, cleanup func
 	}
 
 	s.userDBsMu.Lock()
+	s.evictExpiredDBs()
 	if cached, ok := s.userDBs[token]; ok {
 		s.userDBsMu.Unlock()
 		return cached, func() {}, nil
@@ -196,6 +249,12 @@ func (s *TrinoDataStore) dbForCtx(ctx context.Context) (db *sql.DB, cleanup func
 		Schema:      s.schema,
 		AccessToken: token,
 		SSLCertPath: s.sslCertPath,
+		// The Virtru TDF agent's SessionRepresentationDelegate reads the user JWT
+		// from session.getExtraCredentials().values()[0] when the web UI lists
+		// queries. Without this, the agent throws ArrayIndexOutOfBoundsException
+		// (→ HTTP 500) because AccessToken only sets the Authorization header,
+		// not the Trino extra-credential map.
+		ExtraCredentials: map[string]string{"jwt": token},
 	}).FormatDSN()
 	if err != nil {
 		s.userDBsMu.Unlock()
@@ -212,6 +271,7 @@ func (s *TrinoDataStore) dbForCtx(ctx context.Context) (db *sql.DB, cleanup func
 	authedDB.SetConnMaxLifetime(10 * time.Minute)
 
 	s.userDBs[token] = authedDB
+	s.userDBExp[token] = jwtExpiry(token)
 	s.userDBsMu.Unlock()
 	return authedDB, func() {}, nil
 }
@@ -219,6 +279,12 @@ func (s *TrinoDataStore) dbForCtx(ctx context.Context) (db *sql.DB, cleanup func
 // table returns the fully-qualified Trino table reference catalog.schema.table.
 func (s *TrinoDataStore) table(name string) string {
 	return fmt.Sprintf("%s.%s.%s", s.catalog, s.schema, name)
+}
+
+// plainTable returns the fully-qualified table reference using the plain
+// postgresql catalog (no TDF interception), used for reads that include tdf_blob.
+func (s *TrinoDataStore) plainTable(name string) string {
+	return fmt.Sprintf("%s.%s.%s", s.plainCatalog, s.schema, name)
 }
 
 // parseGeoJSON converts a nullable GeoJSON string (from to_geojson_geometry) into a
@@ -234,6 +300,36 @@ func parseGeoJSON(raw sql.NullString) (*geos.Geom, error) {
 	return g, nil
 }
 
+// logTdfFilter logs TDF row-filtering telemetry for the List* operations.
+// It queries the plain (non-TDF) catalog to get the unfiltered row count for
+// the same src_type + time window, then compares that with the number of rows
+// Trino actually returned after applying the caller's TDF policy entitlements.
+func (s *TrinoDataStore) logTdfFilter(ctx context.Context, authedDB *sql.DB, table string, returned int, srcType string, start, end time.Time, extraFilters ...string) {
+	token := strings.TrimPrefix(trinoAuthTokenFromContext(ctx), "Bearer ")
+	if token == "" {
+		token = s.getFallbackToken()
+	}
+	user := jwtPreferredUsername(token)
+
+	var total int
+	countQ := fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE src_type = ? AND ts >= ? AND ts <= ?`, s.plainTable(table))
+	if err := authedDB.QueryRowContext(ctx, countQ, srcType, start, end).Scan(&total); err != nil {
+		slog.Warn("TDF filter audit: plain count failed", slog.String("error", err.Error()))
+		return
+	}
+
+	filters := append([]string{"tdf_policy"}, extraFilters...)
+	slog.Info("TDF row filter",
+		slog.String("user", user),
+		slog.String("table", table),
+		slog.String("src_type", srcType),
+		slog.Int("total_rows", total),
+		slog.Int("returned_rows", returned),
+		slog.Int("filtered_rows", total-returned),
+		slog.Any("filters_applied", filters),
+	)
+}
+
 // ── TDF object reads ──────────────────────────────────────────────────────────
 
 const trinoGetTdfObject = `
@@ -247,7 +343,7 @@ SELECT
     tdf_blob,
     CAST(tdf_uri  AS VARCHAR)    AS tdf_uri
 FROM %s
-WHERE id = ?
+WHERE id = CAST(? AS UUID)
 LIMIT 1
 `
 
@@ -319,9 +415,14 @@ func (s *TrinoDataStore) ListTdfObjects(ctx context.Context, arg ListTdfObjectsP
 		return nil, err
 	}
 	defer rows.Close()
-	return scanTdfObjectRows[ListTdfObjectsRow](rows, func(r tdfObjectScanResult) ListTdfObjectsRow {
+	items, err := scanTdfObjectRows[ListTdfObjectsRow](rows, func(r tdfObjectScanResult) ListTdfObjectsRow {
 		return ListTdfObjectsRow(r)
 	})
+	if err != nil {
+		return nil, err
+	}
+	s.logTdfFilter(ctx, db, "tdf_objects", len(items), arg.SourceType, arg.StartTime.Time, arg.EndTime.Time)
+	return items, nil
 }
 
 const trinoListTdfObjectsWithGeo = `
@@ -354,9 +455,14 @@ func (s *TrinoDataStore) ListTdfObjectsWithGeo(ctx context.Context, arg ListTdfO
 		return nil, err
 	}
 	defer rows.Close()
-	return scanTdfObjectRows[ListTdfObjectsWithGeoRow](rows, func(r tdfObjectScanResult) ListTdfObjectsWithGeoRow {
+	items, err := scanTdfObjectRows[ListTdfObjectsWithGeoRow](rows, func(r tdfObjectScanResult) ListTdfObjectsWithGeoRow {
 		return ListTdfObjectsWithGeoRow(r)
 	})
+	if err != nil {
+		return nil, err
+	}
+	s.logTdfFilter(ctx, db, "tdf_objects", len(items), arg.SourceType, arg.StartTime.Time, arg.EndTime.Time, "geo")
+	return items, nil
 }
 
 const trinoListTdfObjectsWithSearch = `
@@ -371,7 +477,7 @@ SELECT
     CAST(tdf_uri  AS VARCHAR)    AS tdf_uri
 FROM %s
 WHERE src_type = ? AND ts >= ? AND ts <= ?
-  AND JSON_FORMAT(search) LIKE ?
+  AND CAST(search AS VARCHAR) LIKE ?
 ORDER BY ts DESC
 `
 
@@ -389,9 +495,14 @@ func (s *TrinoDataStore) ListTdfObjectsWithSearch(ctx context.Context, arg ListT
 		return nil, err
 	}
 	defer rows.Close()
-	return scanTdfObjectRows[ListTdfObjectsWithSearchRow](rows, func(r tdfObjectScanResult) ListTdfObjectsWithSearchRow {
+	items, err := scanTdfObjectRows[ListTdfObjectsWithSearchRow](rows, func(r tdfObjectScanResult) ListTdfObjectsWithSearchRow {
 		return ListTdfObjectsWithSearchRow(r)
 	})
+	if err != nil {
+		return nil, err
+	}
+	s.logTdfFilter(ctx, db, "tdf_objects", len(items), arg.SourceType, arg.StartTime.Time, arg.EndTime.Time, "search")
+	return items, nil
 }
 
 const trinoListTdfObjectsWithSearchAndGeo = `
@@ -406,7 +517,7 @@ SELECT
     CAST(tdf_uri  AS VARCHAR)    AS tdf_uri
 FROM %s
 WHERE src_type = ? AND ts >= ? AND ts <= ?
-  AND JSON_FORMAT(search) LIKE ?
+  AND CAST(search AS VARCHAR) LIKE ?
   AND ST_Within(geo, to_geometry(from_geojson_geometry(?)))
 ORDER BY ts DESC
 `
@@ -426,9 +537,14 @@ func (s *TrinoDataStore) ListTdfObjectsWithSearchAndGeo(ctx context.Context, arg
 		return nil, err
 	}
 	defer rows.Close()
-	return scanTdfObjectRows[ListTdfObjectsWithSearchAndGeoRow](rows, func(r tdfObjectScanResult) ListTdfObjectsWithSearchAndGeoRow {
+	items, err := scanTdfObjectRows[ListTdfObjectsWithSearchAndGeoRow](rows, func(r tdfObjectScanResult) ListTdfObjectsWithSearchAndGeoRow {
 		return ListTdfObjectsWithSearchAndGeoRow(r)
 	})
+	if err != nil {
+		return nil, err
+	}
+	s.logTdfFilter(ctx, db, "tdf_objects", len(items), arg.SourceType, arg.StartTime.Time, arg.EndTime.Time, "geo", "search")
+	return items, nil
 }
 
 // tdfObjectScanResult is the common row shape for all tdf_objects SELECT queries.
@@ -483,24 +599,95 @@ func scanTdfObjectRows[T any](rows *sql.Rows, convert func(tdfObjectScanResult) 
 	return items, rows.Err()
 }
 
+// ── TDF policy helpers ────────────────────────────────────────────────────────
+
+// toStringSlice converts a raw JSON value (string or array of strings) to []string.
+func toStringSlice(raw json.RawMessage) []string {
+	if raw == nil {
+		return nil
+	}
+	var arr []string
+	if err := json.Unmarshal(raw, &arr); err == nil {
+		return arr
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil && s != "" {
+		return []string{s}
+	}
+	return nil
+}
+
+// buildTdfPolicy constructs the tdf_policy JSON string from the object's search
+// attributes. The canonical form is HMAC-SHA256 signed with secret so Trino can
+// verify integrity on every read.
+//
+// Policy structure mirrors the client-side logic in attributes.ts:
+//   - default_policy: classification + needToKnow (user must have ALL)
+//   - tdf_policies:   each relTo value as its own group (user needs ANY one)
+func buildTdfPolicy(search []byte, secret string) string {
+	defaultPolicy := []string{}
+	tdfPolicies := [][]string{}
+
+	if len(search) > 0 && string(search) != "null" {
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(search, &m); err == nil {
+			classification := toStringSlice(m["attrClassification"])
+			needToKnow := toStringSlice(m["attrNeedToKnow"])
+			relTo := toStringSlice(m["attrRelTo"])
+
+			defaultPolicy = append(defaultPolicy, classification...)
+			defaultPolicy = append(defaultPolicy, needToKnow...)
+			sort.Strings(defaultPolicy)
+
+			for _, r := range relTo {
+				tdfPolicies = append(tdfPolicies, []string{r})
+			}
+			sort.Slice(tdfPolicies, func(i, j int) bool {
+				fi, fj := "", ""
+				if len(tdfPolicies[i]) > 0 {
+					fi = tdfPolicies[i][0]
+				}
+				if len(tdfPolicies[j]) > 0 {
+					fj = tdfPolicies[j][0]
+				}
+				return fi < fj
+			})
+		} else {
+			slog.Warn("buildTdfPolicy: failed to parse search JSON; using open policy", slog.String("error", err.Error()))
+		}
+	}
+
+	type canonicalDoc struct {
+		TdfPolicies   [][]string `json:"tdf_policies"`
+		DefaultPolicy []string   `json:"default_policy"`
+	}
+	canonical, _ := json.Marshal(canonicalDoc{TdfPolicies: tdfPolicies, DefaultPolicy: defaultPolicy})
+
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(canonical)
+	tag := base64.StdEncoding.EncodeToString(mac.Sum(nil))
+
+	type fullDoc struct {
+		TdfPolicies   [][]string `json:"tdf_policies"`
+		DefaultPolicy []string   `json:"default_policy"`
+		PolicyTag     string     `json:"policy_tag"`
+	}
+	full, _ := json.Marshal(fullDoc{TdfPolicies: tdfPolicies, DefaultPolicy: defaultPolicy, PolicyTag: tag})
+	return string(full)
+}
+
 // ── TDF object writes ─────────────────────────────────────────────────────────
 
-const trinoInsertTdfObject = `
-INSERT INTO %s (id, ts, src_type, geo, search, metadata, tdf_blob, tdf_uri)
-VALUES (
-    CAST(? AS UUID),
-    CAST(? AS TIMESTAMP),
-    ?,
-    to_geometry(from_geojson_geometry(?)),
-    CAST(? AS JSON),
-    CAST(? AS JSON),
-    ?,
-    ?
-)
-`
+// pgQL escapes a string for use as a PostgreSQL string literal (single-quote style).
+func pgQL(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
 
 // InsertTdfObject inserts a row into tdf_objects via Trino.
 // The UUID is generated client-side because Trino does not support RETURNING.
+//
+// Uses system.execute passthrough because the TDF JDBC connector's beginInsert
+// returns null write-mappings for jsonb and bytea column types, causing an NPE.
 func (s *TrinoDataStore) InsertTdfObject(ctx context.Context, arg CreateTdfObjectsParams) (uuid.UUID, error) {
 	db, cleanup, err := s.dbForCtx(ctx)
 	if err != nil {
@@ -509,26 +696,37 @@ func (s *TrinoDataStore) InsertTdfObject(ctx context.Context, arg CreateTdfObjec
 	defer cleanup()
 
 	id := uuid.New()
-	geoJSON := ""
-	if arg.Geo != nil {
-		geoJSON = arg.Geo.ToGeoJSON(0)
-	}
 	tdfURI := ""
 	if arg.TdfUri.Valid {
 		tdfURI = arg.TdfUri.String
 	}
 
-	q := fmt.Sprintf(trinoInsertTdfObject, s.table("tdf_objects"))
-	_, err = db.ExecContext(ctx, q,
-		id.String(),
-		arg.Ts.Time.UTC().Format(time.RFC3339Nano),
-		arg.SrcType,
-		geoJSON,
-		string(arg.Search),
-		string(arg.Metadata),
-		arg.TdfBlob,
-		tdfURI,
+	var geoExpr string
+	if arg.Geo != nil {
+		geoExpr = "ST_GeomFromGeoJSON(" + pgQL(arg.Geo.ToGeoJSON(0)) + ")"
+	} else {
+		geoExpr = "NULL"
+	}
+
+	tdfPolicy := buildTdfPolicy(arg.Search, s.signingSecret)
+
+	innerSQL := fmt.Sprintf(
+		"INSERT INTO %s.tdf_objects (id, ts, src_type, geo, search, metadata, tdf_blob, tdf_uri, tdf_policy) VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb, decode(%s, 'hex'), %s, %s::jsonb)",
+		s.schema,
+		pgQL(id.String()),
+		pgQL(arg.Ts.Time.UTC().Format("2006-01-02 15:04:05.999999")),
+		pgQL(arg.SrcType),
+		geoExpr,
+		pgQL(string(arg.Search)),
+		pgQL(string(arg.Metadata)),
+		pgQL(fmt.Sprintf("%x", arg.TdfBlob)),
+		pgQL(tdfURI),
+		pgQL(tdfPolicy),
 	)
+
+	callSQL := fmt.Sprintf("CALL %s.system.execute(query => '%s')",
+		s.catalog, strings.ReplaceAll(innerSQL, "'", "''"))
+	_, err = db.ExecContext(ctx, callSQL)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("trino insert tdf_object: %w", err)
 	}
@@ -599,7 +797,7 @@ SELECT
     JSON_FORMAT(search)        AS search,
     CAST(tdf_uri   AS VARCHAR) AS tdf_uri
 FROM %s
-WHERE id = ?
+WHERE id = CAST(? AS UUID)
 LIMIT 1
 `
 
@@ -610,7 +808,11 @@ func (s *TrinoDataStore) GetNoteByID(ctx context.Context, id uuid.UUID) (GetNote
 	}
 	defer cleanup()
 
-	q := fmt.Sprintf(trinoGetNoteByID, s.table("tdf_notes"))
+	// Notes tdf_blob is created by the JS SDK with EMBEDDED_POLICY_ENCRYPTED; the TDF connector
+	// requires EMBEDDED_POLICY_PLAIN_TEXT and rejects the blob at read time. Use the plain catalog
+	// to bypass blob interception. Row-level access control is enforced on the parent tdf_objects
+	// row, which is always fetched through the TDF connector before notes are displayed.
+	q := fmt.Sprintf(trinoGetNoteByID, s.plainTable("tdf_notes"))
 	row := db.QueryRowContext(ctx, q, id.String())
 
 	var (
@@ -649,7 +851,7 @@ SELECT
     tdf_blob,
     CAST(tdf_uri   AS VARCHAR) AS tdf_uri
 FROM %s
-WHERE parent_id = ?
+WHERE parent_id = CAST(? AS UUID)
 `
 
 func (s *TrinoDataStore) GetNotesFromPar(ctx context.Context, parentID uuid.UUID) ([]GetNotesFromParRow, error) {
@@ -659,7 +861,8 @@ func (s *TrinoDataStore) GetNotesFromPar(ctx context.Context, parentID uuid.UUID
 	}
 	defer cleanup()
 
-	q := fmt.Sprintf(trinoGetNotesFromPar, s.table("tdf_notes"))
+	// Same reason as GetNoteByID: use plain catalog to avoid TDF connector blob interception.
+	q := fmt.Sprintf(trinoGetNotesFromPar, s.plainTable("tdf_notes"))
 	rows, err := db.QueryContext(ctx, q, parentID.String())
 	if err != nil {
 		return nil, err
@@ -671,8 +874,8 @@ func (s *TrinoDataStore) GetNotesFromPar(ctx context.Context, parentID uuid.UUID
 		var (
 			idStr, parentIDStr string
 			ts                 time.Time
-			search, tdfURI     sql.NullString
 			tdfBlob            []byte
+			search, tdfURI     sql.NullString
 		)
 		if err := rows.Scan(&idStr, &ts, &parentIDStr, &search, &tdfBlob, &tdfURI); err != nil {
 			return nil, err
@@ -697,20 +900,11 @@ func (s *TrinoDataStore) GetNotesFromPar(ctx context.Context, parentID uuid.UUID
 	return items, rows.Err()
 }
 
-const trinoInsertNoteObject = `
-INSERT INTO %s (id, ts, parent_id, search, tdf_blob, tdf_uri)
-VALUES (
-    CAST(? AS UUID),
-    CAST(? AS TIMESTAMP),
-    CAST(? AS UUID),
-    CAST(? AS JSON),
-    ?,
-    ?
-)
-`
-
 // InsertNoteObject inserts a row into tdf_notes via Trino.
 // UUID is generated client-side since Trino does not support RETURNING.
+//
+// Uses system.execute passthrough because the TDF JDBC connector's beginInsert
+// returns null write-mappings for jsonb and bytea column types, causing an NPE.
 func (s *TrinoDataStore) InsertNoteObject(ctx context.Context, arg CreateNoteObjectParams) (uuid.UUID, error) {
 	db, cleanup, err := s.dbForCtx(ctx)
 	if err != nil {
@@ -724,15 +918,23 @@ func (s *TrinoDataStore) InsertNoteObject(ctx context.Context, arg CreateNoteObj
 		tdfURI = arg.TdfUri.String
 	}
 
-	q := fmt.Sprintf(trinoInsertNoteObject, s.table("tdf_notes"))
-	_, err = db.ExecContext(ctx, q,
-		id.String(),
-		arg.Ts.Time.UTC().Format(time.RFC3339Nano),
-		arg.ParentID.String(),
-		string(arg.Search),
-		arg.TdfBlob,
-		tdfURI,
+	tdfPolicy := buildTdfPolicy(arg.Search, s.signingSecret)
+
+	innerSQL := fmt.Sprintf(
+		"INSERT INTO %s.tdf_notes (id, ts, parent_id, search, tdf_blob, tdf_uri, tdf_policy) VALUES (%s, %s, %s, %s::jsonb, decode(%s, 'hex'), %s, %s::jsonb)",
+		s.schema,
+		pgQL(id.String()),
+		pgQL(arg.Ts.Time.UTC().Format("2006-01-02 15:04:05.999999")),
+		pgQL(arg.ParentID.String()),
+		pgQL(string(arg.Search)),
+		pgQL(fmt.Sprintf("%x", arg.TdfBlob)),
+		pgQL(tdfURI),
+		pgQL(tdfPolicy),
 	)
+
+	callSQL := fmt.Sprintf("CALL %s.system.execute(query => '%s')",
+		s.catalog, strings.ReplaceAll(innerSQL, "'", "''"))
+	_, err = db.ExecContext(ctx, callSQL)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("trino insert tdf_note: %w", err)
 	}
@@ -750,7 +952,7 @@ func (s *TrinoDataStore) ListSrcTypes(ctx context.Context) ([]string, error) {
 	}
 	defer cleanup()
 
-	q := fmt.Sprintf(trinoListSrcTypes, s.table("src_types"))
+	q := fmt.Sprintf(trinoListSrcTypes, s.plainTable("src_types"))
 	rows, err := db.QueryContext(ctx, q)
 	if err != nil {
 		return nil, err
@@ -785,7 +987,7 @@ func (s *TrinoDataStore) GetSrcType(ctx context.Context, id string) (SrcType, er
 	}
 	defer cleanup()
 
-	q := fmt.Sprintf(trinoGetSrcType, s.table("src_types"))
+	q := fmt.Sprintf(trinoGetSrcType, s.plainTable("src_types"))
 	row := db.QueryRowContext(ctx, q, id)
 
 	var (

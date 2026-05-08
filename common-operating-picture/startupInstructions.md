@@ -58,6 +58,32 @@ Run the key generation script:
 make dev-certs
 ```
 
+#### Trino TLS Certificates
+
+After generating local certs, create the PKCS12 keystore and JVM truststore that Trino uses for HTTPS. Both are derived from the `rootCA.pem` produced above.
+
+```bash
+# 1. Create server.p12 — Trino's HTTPS server keystore
+#    Bundles the local-dsp.virtru.com cert + key + CA into a PKCS12 file
+openssl pkcs12 -export \
+  -in dsp-keys/local-dsp.virtru.com.pem \
+  -inkey dsp-keys/local-dsp.virtru.com.key.pem \
+  -certfile dsp-keys/rootCA.pem \
+  -out compose/trino-config/certs/server.p12 \
+  -passout pass:changeit
+
+# 2. Copy rootCA.pem into the trino certs directory
+cp dsp-keys/rootCA.pem compose/trino-config/certs/rootCA.pem
+
+# 3. Create truststore.jks — JVM truststore so Trino's coordinator trusts the CA
+keytool -import -trustcacerts -alias rootCA \
+  -file compose/trino-config/certs/rootCA.pem \
+  -keystore compose/trino-config/certs/truststore.jks \
+  -storepass changeit -noprompt
+```
+
+> The password `changeit` must match `http-server.https.keystore.password` in `compose/trino-config/config.properties`.
+
 ### Step 2: Unpack the Bundle
 
 Unzip the main bundle and unpack the specific DSP tools. Replace `X.X.X`, `<os>`, and `<arch>` with your specific version and system details.

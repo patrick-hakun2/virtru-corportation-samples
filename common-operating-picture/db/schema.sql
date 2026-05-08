@@ -1,4 +1,5 @@
 CREATE EXTENSION IF NOT EXISTS postgis;
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 /*
 	#############################################################################
@@ -28,6 +29,24 @@ CREATE TABLE IF NOT EXISTS tdf_objects (
   metadata JSONB NULL,
   tdf_blob BYTEA NULL,
   tdf_uri TEXT NULL,
+  -- Row-level access control for TDF/Trino connector (v0.6.0+).
+  -- Default is an open policy (empty default_policy) signed with the deployment secret.
+  -- The secret is injected at schema creation time via psql -v tdf_signing_secret=<value>.
+  -- Rows with attributes must provide tdf_policy explicitly (Go buildTdfPolicy / seed_data.py).
+  tdf_policy JSONB NOT NULL DEFAULT (
+    jsonb_build_object(
+      'tdf_policies', '[]'::jsonb,
+      'default_policy', '[]'::jsonb,
+      'policy_tag', encode(
+        hmac(
+          '{"tdf_policies":[],"default_policy":[]}'::bytea,
+          :'tdf_signing_secret'::bytea,
+          'sha256'
+        ),
+        'base64'
+      )
+    )
+  ),
 	_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 	_created_by TEXT DEFAULT 'anonymous'
 );
@@ -61,6 +80,10 @@ CREATE OR REPLACE TRIGGER notify_tdf_objects_inserted
 	FOR EACH ROW
 	EXECUTE PROCEDURE notify_tdf_objects_inserted();
 
+CREATE INDEX IF NOT EXISTS idx_tdf_objects_src_type_ts ON tdf_objects(src_type, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_tdf_objects_geo ON tdf_objects USING GIST(geo);
+CREATE INDEX IF NOT EXISTS idx_tdf_objects_search ON tdf_objects USING GIN(search);
+
 
 /*
 	#############################################################################
@@ -76,6 +99,21 @@ CREATE TABLE IF NOT EXISTS tdf_notes (
   CONSTRAINT parent_id FOREIGN KEY (parent_id) REFERENCES tdf_objects(id) ON DELETE CASCADE,  -- Corrected foreign key constraint
 
   tdf_uri TEXT NULL,
+  -- Same open-policy default as tdf_objects; explicit tdf_policy should be provided per row.
+  tdf_policy JSONB NOT NULL DEFAULT (
+    jsonb_build_object(
+      'tdf_policies', '[]'::jsonb,
+      'default_policy', '[]'::jsonb,
+      'policy_tag', encode(
+        hmac(
+          '{"tdf_policies":[],"default_policy":[]}'::bytea,
+          :'tdf_signing_secret'::bytea,
+          'sha256'
+        ),
+        'base64'
+      )
+    )
+  ),
   _created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   _created_by TEXT DEFAULT 'anonymous'
 );
@@ -107,3 +145,5 @@ CREATE OR REPLACE TRIGGER notify_tdf_note_objects_inserted
 	AFTER INSERT ON tdf_notes
 	FOR EACH ROW
 	EXECUTE PROCEDURE notify_tdf_note_objects_inserted();
+
+CREATE INDEX IF NOT EXISTS idx_tdf_notes_parent_id ON tdf_notes(parent_id);

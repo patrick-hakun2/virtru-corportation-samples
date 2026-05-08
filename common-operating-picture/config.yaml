@@ -12,6 +12,7 @@
 # The URL of the database to connect to (e.g. postgres://user:password@host:port/database)
 # https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING
 # Pool settings https://pkg.go.dev/github.com/jackc/pgx/v5@v5.5.5/pgxpool#ParseConfig
+db_url: postgres://postgres:changeme@cop-db:5432/postgres
 data_source:
   plugin: trino  # "postgres" | "trino"
   trino:
@@ -19,6 +20,8 @@ data_source:
     catalog: tdf_postgresql
     schema: public
     user: admin
+    # Must match tdf.policy-signing-secret in compose/trino-config/catalog/tdf_postgresql.properties
+    # Set via env var: DSP_COP_DATA_SOURCE_TRINO_POLICY_SIGNING_SECRET
 ## DSP platform endpoint
 platform_endpoint: https://local-dsp.virtru.com:8080
 

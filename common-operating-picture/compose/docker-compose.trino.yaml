@@ -1,48 +1,54 @@
 version: '3.8'
+
+x-trino-common: &trino-common
+  image: localhost:5000/virtru/tdf-trino:0.6.0
+  platform: linux/amd64
+  restart: always
+  healthcheck:
+    test: ["CMD", "/usr/lib/trino/bin/health-check"]
+    interval: 15s
+    timeout: 10s
+    retries: 5
+    start_period: 120s
+  depends_on:
+    dsp:
+      condition: service_healthy
+      restart: true
+  extra_hosts:
+    local-dsp.virtru.com: "host-gateway"
+  volumes:
+    - ./trino-config/catalog:/etc/trino/catalog
+    - ./trino-config/certs:/etc/trino/certs
+    - ./trino-config/header-authenticator.properties:/etc/trino/header-authenticator.properties
+
 services:
-  tdf-trino:
-    image: localhost:5000/virtru/tdf-trino:latest
-    container_name: tdf-trino
-    platform: linux/arm64
-    restart: always
-    depends_on:
-      dsp:
-        condition: service_healthy
-        restart: true
-    #command: ["trino", "--server", "trino:8080", "--catalog", "postgresql", "--schema", "public"]
-    # depends_on:
-    #   postgres-db:
-    #     condition: service_healthy
-    #     restart: true
-    environment:
-      JAVA_TOOL_OPTIONS: "-Djavax.net.ssl.trustStore=/etc/trino/certs/truststore.jks -Djavax.net.ssl.trustStorePassword=changeit"
-    extra_hosts:
-      local-dsp.virtru.com: "host-gateway"
+  tdf-trino-coordinator:
+    <<: *trino-common
+    container_name: tdf-trino-coordinator
     ports:
       - "28080:8080"
       - "28443:8443"
     volumes:
       - ./trino-config/catalog:/etc/trino/catalog
       - ./trino-config/certs:/etc/trino/certs
-      - ./trino-config/config.properties:/etc/trino/config.properties
+      - ./trino-config/coordinator/config.properties:/etc/trino/config.properties
+      - ./trino-config/coordinator/jvm.config:/etc/trino/jvm.config
       - ./trino-config/header-authenticator.properties:/etc/trino/header-authenticator.properties
-      # Patched JARs: fix for NPE in TDFAccessControl.shouldApplyFilter when
-      # QueryCreatedEvent.getContext() throws/returns null in Trino 476.
-      # Adds try-catch around getContext() + null check on returned QueryContext.
-      - ./trino-config/patched-jars/tdf-trino-476.jar:/usr/lib/trino/plugin/tdf-trino/tdf-trino-476.jar
-      - ./trino-config/patched-jars/virtru.trino_tdf-trino-476.jar:/usr/lib/trino/plugin/tdf-trino/virtru.trino_tdf-trino-476.jar
-    # networks:
-    #   - trino-network
 
-  # postgres-db:
-  #   image: postgres:latest
-  #   container_name: postgres-db
-  #   environment:
-  #     POSTGRES_USER: trino_user
-  #     POSTGRES_PASSWORD: password123
-#     networks:
-#       - trino-network
+  # tdf-trino-worker-1:
+  #   <<: *trino-common
+  #   container_name: tdf-trino-worker-1
+  #   volumes:
+  #     - ./trino-config/catalog:/etc/trino/catalog
+  #     - ./trino-config/certs:/etc/trino/certs
+  #     - ./trino-config/worker/config.properties:/etc/trino/config.properties
+  #     - ./trino-config/header-authenticator.properties:/etc/trino/header-authenticator.properties
 
-# networks:
-#   trino-network:
-#     driver: bridge
+  # tdf-trino-worker-2:
+  #   <<: *trino-common
+  #   container_name: tdf-trino-worker-2
+  #   volumes:
+  #     - ./trino-config/catalog:/etc/trino/catalog
+  #     - ./trino-config/certs:/etc/trino/certs
+  #     - ./trino-config/worker/config.properties:/etc/trino/config.properties
+  #     - ./trino-config/header-authenticator.properties:/etc/trino/header-authenticator.properties

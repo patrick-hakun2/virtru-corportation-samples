@@ -52,6 +52,9 @@ type TrinoConfig struct {
 	SSLCertPath string `mapstructure:"ssl_cert_path"`
 	// InsecureSkipVerify skips TLS certificate verification.
 	InsecureSkipVerify bool `mapstructure:"insecure_skip_verify"`
+	// PolicySigningSecret is the HMAC-SHA256 key used to sign and verify tdf_policy rows.
+	// Must match tdf.policy-signing-secret in the Trino catalog properties file.
+	PolicySigningSecret string `mapstructure:"policy_signing_secret"`
 }
 
 // DataSourceConfig selects which database plugin to use and holds its settings.
@@ -153,6 +156,12 @@ func New() (*Config, error) {
 	v.SetEnvPrefix(AppName)
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	v.AutomaticEnv()
+
+	// AppName is "dsp-cop", so Viper's automatic prefix becomes "DSP-COP_" (with hyphen).
+	// Shell/Docker env vars cannot have hyphens, so the automatic lookup for
+	// DSP-COP_DATA_SOURCE_TRINO_POLICY_SIGNING_SECRET silently fails.
+	// BindEnv maps the underscore-safe name the docker-compose actually sets.
+	_ = v.BindEnv("data_source.trino.policy_signing_secret", "DSP_COP_DATA_SOURCE_TRINO_POLICY_SIGNING_SECRET")
 
 	// Read the config file
 	if err := v.ReadInConfig(); err != nil {

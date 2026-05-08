@@ -99,9 +99,7 @@ func NewCopServer(c *config.Config, staticFs fs.FS) *CopServer {
 		}
 		dataStore = trinoStore
 
-		// The TDF connector requires a JWT on every table access — even for
-		// server-initiated queries (e.g. src_type lookups).  Fetch a
-		// service-account token using the configured client credentials and
+		// Fetch a service-account token using the configured client credentials and
 		// refresh it in the background before it expires.
 		go func() {
 			tokenURL := c.DeprecatedIdpUrl + "/protocol/openid-connect/token"
@@ -300,7 +298,6 @@ func createGrpcServer(server *TdfObjectServer) *http.Server {
 	}).Handler(handler))
 
 	// Register TdfNoteService on gRPC server.
-	// Ensure you're using the correct handler generated for the TdfNoteService
 	pathNote, handlerNote := tdf_notev1connect.NewTdfNoteServiceHandler(
 		server, // your service implementation here
 		connect.WithInterceptors(getInterceptors()...), // apply any interceptors you need

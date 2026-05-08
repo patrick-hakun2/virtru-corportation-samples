@@ -534,6 +534,8 @@ func (s *TdfObjectServer) GetSrcType(
 	req *connect.Request[tdf_objectv1.GetSrcTypeRequest],
 ) (*connect.Response[tdf_objectv1.GetSrcTypeResponse], error) {
 
+	ctx = db.WithTrinoAuthToken(ctx, req.Header().Get("Authorization"))
+
 	srcType, err := dbQuerySrcType(ctx, s.DBStore, req.Msg.SrcType)
 	if err != nil {
 		return nil, err
@@ -550,6 +552,8 @@ func (s *TdfObjectServer) ListSrcTypes(
 	ctx context.Context,
 	req *connect.Request[tdf_objectv1.ListSrcTypesRequest],
 ) (*connect.Response[tdf_objectv1.ListSrcTypesResponse], error) {
+
+	ctx = db.WithTrinoAuthToken(ctx, req.Header().Get("Authorization"))
 
 	srcTypes, err := s.DBStore.ListSrcTypes(ctx)
 	if err != nil {

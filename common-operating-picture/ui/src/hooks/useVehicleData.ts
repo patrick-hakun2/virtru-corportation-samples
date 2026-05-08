@@ -8,12 +8,11 @@ import { VehicleData } from '@/types/vehicle';
 import dayjs from 'dayjs';
 
 const VEHICLE_SRC_TYPE_ID = 'vehicles';
-const POLL_INTERVAL_MS = 30_000; // Trino queries take 10-24s in planning alone; 5s caused pileup
+const POLL_INTERVAL_MS = 5_000;
 
 export function useVehicleData() {
   const { getSrcType, queryTdfObjectsLight } = useRpcClient();
   const { activeEntitlements } = useContext(BannerContext);
-  const fetchingRef = useRef(false);
 
   const [vehicleData, setVehicleData] = useState<VehicleData[]>([]);
   const [vehicleSrcType, setVehicleSrcType] = useState<SrcType>();
@@ -32,8 +31,6 @@ export function useVehicleData() {
   }, [vehicleData, activeEntitlements]);
 
   const fetchVehicles = useCallback(async () => {
-    if (fetchingRef.current) return;
-    fetchingRef.current = true;
     try {
       const tsRange = new TimestampSelector();
       tsRange.greaterOrEqualTo = Timestamp.fromDate(dayjs().subtract(24, 'hour').toDate());
@@ -75,10 +72,14 @@ export function useVehicleData() {
     } catch (error) {
       console.error('Error fetching vehicles:', error);
       setVehicleData([]);
-    } finally {
-      fetchingRef.current = false;
     }
   }, [queryTdfObjectsLight]);
+
+  // Keep a ref to the latest fetchVehicles so the interval never needs to reset.
+  const fetchVehiclesRef = useRef(fetchVehicles);
+  useEffect(() => {
+    fetchVehiclesRef.current = fetchVehicles;
+  }, [fetchVehicles]);
 
   // Fetch vehicle source type schema once
   useEffect(() => {
@@ -96,16 +97,14 @@ export function useVehicleData() {
     fetchSchema();
   }, [getSrcType, vehicleSrcType]);
 
-  // Initial fetch
+  // Initial fetch + stable poll — empty deps so the interval is set once on
+  // mount and never cleared/reset when fetchVehicles changes reference.
   useEffect(() => {
-    fetchVehicles();
-  }, [fetchVehicles]);
-
-  // Poll for updates
-  useEffect(() => {
-    const intervalId = setInterval(fetchVehicles, POLL_INTERVAL_MS);
+    fetchVehiclesRef.current();
+    const intervalId = setInterval(() => fetchVehiclesRef.current(), POLL_INTERVAL_MS);
     return () => clearInterval(intervalId);
-  }, [fetchVehicles]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return {
     filteredVehicleData,

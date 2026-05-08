@@ -36,13 +36,14 @@ services:
       bash -c ' \
         echo \"Starting COP DB setup...\" \
         && echo \"Setting up PostGIS and the DB schema...\" \
-        && psql -h cop-db -U postgres -d postgres -f /scripts/schema.sql \
+        && psql -h cop-db -U postgres -d postgres -v tdf_signing_secret="$TDF_SIGNING_SECRET" -f /scripts/schema.sql \
         && echo \"Setting up Source Types seed data...\" \
         && psql -h cop-db -U postgres -d postgres -f /scripts/seed.sql \
         && echo \"Database setup complete.\" \
       '
     environment:
       - PGPASSWORD=changeme
+      - TDF_SIGNING_SECRET=${DSP_COP_DATA_SOURCE_TRINO_POLICY_SIGNING_SECRET}
     volumes:
       - ../db/schema.sql:/scripts/schema.sql
       - ../db/seed.sql:/scripts/seed.sql
