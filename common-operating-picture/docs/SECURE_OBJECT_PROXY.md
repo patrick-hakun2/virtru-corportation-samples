@@ -30,7 +30,7 @@ mc alias set s4 http://s4-test.localhost:7070 "user" "replaceme" --api "S3v4" --
 ```
 
 Get Bearer Token
-AUTH_TOKEN=$(./get_jwt.sh --quiet)
+AUTH_TOKEN=$(./scripts/ops/get_jwt.sh --quiet)
 ```shell
 AUTH_TOKEN=$(curl -d 'client_id=opentdf' -d 'client_secret=secret' -d 'grant_type=client_credentials' 'https://local-dsp.virtru.com:8443/auth/realms/opentdf/protocol/openid-connect/token' | jq -r .access_token)
 ```

@@ -1,7 +1,9 @@
 # check=skip=SecretsUsedInArgOrEnv
+# syntax=docker/dockerfile:1
 
 # --- STAGE 1: Frontend Build ---
 FROM node:22-alpine AS ui-builder
+ARG VITE_S4_ENDPOINT
 ARG VITE_TILE_SERVER_URL
 ARG VITE_GRPC_SERVER_URL
 ARG VITE_DSP_BASE_URL
@@ -10,6 +12,7 @@ ARG VITE_DSP_KC_SERVER_URL
 ARG VITE_DSP_KC_CLIENT_ID
 ARG VITE_DSP_KC_DIRECT_AUTH
 
+ENV VITE_S4_ENDPOINT=$VITE_S4_ENDPOINT
 ENV VITE_TILE_SERVER_URL=$VITE_TILE_SERVER_URL
 ENV VITE_GRPC_SERVER_URL=$VITE_GRPC_SERVER_URL
 ENV VITE_DSP_BASE_URL=$VITE_DSP_BASE_URL
@@ -20,9 +23,10 @@ ENV VITE_DSP_KC_DIRECT_AUTH=$VITE_DSP_KC_DIRECT_AUTH
 
 WORKDIR /app
 COPY ui/package.json ui/package-lock.json ./
-RUN npm ci
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --cache /root/.npm
 COPY ui/ .
-COPY /sample.federal_policy.yaml /sample.federal_policy.yaml
+COPY config/samples/sample.federal_policy.yaml /config/samples/sample.federal_policy.yaml
 RUN npm run build
 
 # --- STAGE 2: GEOS Libs Build ---
@@ -36,10 +40,11 @@ WORKDIR /app
 RUN python -m venv /app/venv
 # Ensure we use the venv's pip
 COPY requirements.txt .
-RUN /app/venv/bin/pip install --no-cache-dir -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    /app/venv/bin/pip install -r requirements.txt
 
-# --- STAGE 4: Go Build Setup ---
-FROM cgr.dev/chainguard/go@sha256:dc53da3597aa89079c0bd3f402738bf910f2aa635f23d42f29b7e534a61e8149 AS go-setup
+# --- STAGE 4: Go Build ---
+FROM cgr.dev/chainguard/go@sha256:dc53da3597aa89079c0bd3f402738bf910f2aa635f23d42f29b7e534a61e8149 AS builder
 ARG TARGETOS TARGETARCH
 
 COPY --from=geos-builder /usr/lib/libgeos* /usr/lib/
@@ -49,12 +54,18 @@ COPY --from=geos-builder /usr/include/geos.h /usr/include/
 COPY --from=geos-builder /usr/lib/pkgconfig/geos.pc /usr/lib/pkgconfig/geos.pc
 
 WORKDIR /app
+# Copy dependency manifests first so module download is cached independently of source changes
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    go mod download && go mod verify
+
+# Now copy remaining source and build
 COPY --from=ui-builder /app/dist /app/ui/dist
 COPY . .
-
-FROM go-setup AS builder
-RUN go mod download && go mod verify
-RUN GOOS=$TARGETOS GOARCH=$TARGETARCH go build -tags embedfiles -o dsp-cop .
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    GOOS=$TARGETOS GOARCH=$TARGETARCH go build -tags embedfiles -o dsp-cop .
 
 # --- STAGE 5: Final Runtime ---
 FROM cgr.dev/chainguard/glibc-dynamic@sha256:ef35f036cfe4d7ee20107ab358e038da0be69e93304c8c62dc8e5c0787d9a9c5
@@ -73,7 +84,7 @@ COPY --from=python-builder /app/venv /app/venv
 
 # 4. Bring in Go Binary and Python Scripts
 COPY --from=builder /app/dsp-cop /usr/bin/
-COPY seed_data.py read_s4.py sim_data_fake_opensky.py sim_data.py /app/
+COPY scripts/seed/seed_data.py scripts/seed/read_s4.py scripts/seed/sim_data_fake_opensky.py scripts/seed/sim_data.py scripts/seed/sim_nifi_seed.py scripts/seed/add_manifests.py /app/scripts/seed/
 
 # 5. Environment
 ENV PATH="/app/venv/bin:/usr/bin:${PATH}"

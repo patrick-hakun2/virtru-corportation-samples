@@ -1,4 +1,5 @@
 # Local development
+env/*.env
 db-data
 dsp-keys
 proto_vendor/
@@ -11,6 +12,8 @@ geos-*.apk
 geos/
 # Sensitive or environment-specific configuration
 etc/
+config.yaml
+config.local.yaml
 
 # Nifi
 **/truststore
@@ -30,3 +33,9 @@ node_modules/
 COP_venv/
 
 compose/minio-data/
+nifi/sample_data/mission_example/
+
+# Local artifacts / generated
+aws/
+extracted/
+ui/dist/

@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"connectrpc.com/connect"
@@ -580,6 +581,8 @@ func (s *TdfObjectServer) RunPythonScript(
 		return s.handleSimulationStart(ctx)
 	case "simulation_stop":
 		return s.handleSimulationStop(ctx)
+	case "simulation_status":
+		return s.handleSimulationStatus(ctx)
 	default:
 		return connect.NewResponse(&tdf_objectv1.RunPythonScriptResponse{
 			Output:   fmt.Sprintf("Unknown script_id: %q. Use 'simulation_start' or 'simulation_stop'.", req.Msg.ScriptId),
@@ -591,17 +594,18 @@ func (s *TdfObjectServer) RunPythonScript(
 func (s *TdfObjectServer) handleSimulationStart(ctx context.Context) (*connect.Response[tdf_objectv1.RunPythonScriptResponse], error) {
 	var combinedOutput strings.Builder
 
-	seedScript := "seed_data.py"
-	slog.InfoContext(ctx, "Running seed script", slog.String("script", seedScript))
+	// Step 1: copy seed file to NiFi watch folder and wait for ingestion
+	nifiSeedScript := "scripts/seed/sim_nifi_seed.py"
+	slog.InfoContext(ctx, "Running NiFi seed script", slog.String("script", nifiSeedScript))
 
 	start := time.Now()
-	seedCmd := exec.CommandContext(ctx, "python3", fmt.Sprintf("./%s", seedScript), "--delete")
-	seedCmd.Dir = "./"
+	nifiSeedCmd := exec.CommandContext(ctx, "python3", fmt.Sprintf("./%s", nifiSeedScript))
+	nifiSeedCmd.Dir = "./"
 
-	output, err := seedCmd.CombinedOutput()
+	output, err := nifiSeedCmd.CombinedOutput()
 	duration := time.Since(start)
 
-	combinedOutput.WriteString(fmt.Sprintf("--- Result of %s (Duration: %v) ---\n", seedScript, duration))
+	combinedOutput.WriteString(fmt.Sprintf("--- Result of %s (Duration: %v) ---\n", nifiSeedScript, duration))
 	combinedOutput.Write(output)
 	combinedOutput.WriteString("\n")
 
@@ -610,19 +614,52 @@ func (s *TdfObjectServer) handleSimulationStart(ctx context.Context) (*connect.R
 		if exitError, ok := err.(*exec.ExitError); ok {
 			exitCode = exitError.ExitCode()
 		}
-		slog.ErrorContext(ctx, "Seed script failed",
+		slog.ErrorContext(ctx, "NiFi seed script failed",
 			slog.Int("exit_code", exitCode),
 			slog.String("python_traceback", string(output)),
 		)
 		return connect.NewResponse(&tdf_objectv1.RunPythonScriptResponse{
-			Output:   combinedOutput.String() + fmt.Sprintf("\nERROR in %s: %s", seedScript, string(output)),
+			Output:   combinedOutput.String() + fmt.Sprintf("\nERROR in %s: %s", nifiSeedScript, string(output)),
 			ExitCode: int32(exitCode),
 		}), nil
 	}
 
-	slog.InfoContext(ctx, "Seed script completed", slog.Duration("duration", duration))
+	slog.InfoContext(ctx, "NiFi seed complete", slog.Duration("duration", duration))
 
-	simScript := "sim_data_fake_opensky.py"
+	// Step 2: add classified manifests to the NiFi-ingested vehicles
+	manifestScript := "scripts/seed/add_manifests.py"
+	slog.InfoContext(ctx, "Running manifest script", slog.String("script", manifestScript))
+
+	manifestStart := time.Now()
+	manifestCmd := exec.CommandContext(ctx, "python3", fmt.Sprintf("./%s", manifestScript))
+	manifestCmd.Dir = "./"
+
+	manifestOutput, manifestErr := manifestCmd.CombinedOutput()
+	manifestDuration := time.Since(manifestStart)
+
+	combinedOutput.WriteString(fmt.Sprintf("--- Result of %s (Duration: %v) ---\n", manifestScript, manifestDuration))
+	combinedOutput.Write(manifestOutput)
+	combinedOutput.WriteString("\n")
+
+	if manifestErr != nil {
+		exitCode := 1
+		if exitError, ok := manifestErr.(*exec.ExitError); ok {
+			exitCode = exitError.ExitCode()
+		}
+		slog.ErrorContext(ctx, "Manifest script failed",
+			slog.Int("exit_code", exitCode),
+			slog.String("python_traceback", string(manifestOutput)),
+		)
+		return connect.NewResponse(&tdf_objectv1.RunPythonScriptResponse{
+			Output:   combinedOutput.String() + fmt.Sprintf("\nERROR in %s: %s", manifestScript, string(manifestOutput)),
+			ExitCode: int32(exitCode),
+		}), nil
+	}
+
+	slog.InfoContext(ctx, "Manifest script completed", slog.Duration("duration", manifestDuration))
+
+	// Step 3: launch position simulation in background
+	simScript := "scripts/seed/sim_data_fake_opensky.py"
 
 	simMu.Lock()
 	defer simMu.Unlock()
@@ -705,6 +742,29 @@ func (s *TdfObjectServer) handleSimulationStop(ctx context.Context) (*connect.Re
 
 	return connect.NewResponse(&tdf_objectv1.RunPythonScriptResponse{
 		Output:   msg,
+		ExitCode: 0,
+	}), nil
+}
+
+func (s *TdfObjectServer) handleSimulationStatus(ctx context.Context) (*connect.Response[tdf_objectv1.RunPythonScriptResponse], error) {
+	simMu.Lock()
+	defer simMu.Unlock()
+
+	isRunning := false
+	if simProcess != nil && simProcess.Process != nil {
+		// Signal(0) checks if the process is alive without killing it
+		err := simProcess.Process.Signal(syscall.Signal(0))
+		if err == nil {
+			isRunning = true
+		} else {
+			simProcess = nil
+		}
+	}
+
+	slog.InfoContext(ctx, "Status Check Executed", slog.Bool("isRunning", isRunning))
+
+	return connect.NewResponse(&tdf_objectv1.RunPythonScriptResponse{
+		Output:   fmt.Sprintf("STATUS:%v", isRunning), // Use a prefix for easy parsing
 		ExitCode: 0,
 	}), nil
 }

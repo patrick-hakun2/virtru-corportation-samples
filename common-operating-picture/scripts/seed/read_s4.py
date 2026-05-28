@@ -16,23 +16,27 @@ logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger(__name__)
 
 # --- Configuration (Matches your Seed Script) ---
-KC_URL = os.getenv("KEYCLOAK_URL", "https://local-dsp.virtru.com:8443/auth")
+_hostname = os.getenv("PLATFORM_HOSTNAME", "local-dsp.virtru.com")
+_https_port = os.getenv("PLATFORM_HTTPS_PORT", "8443")
+KC_URL = os.getenv("KEYCLOAK_URL", f"https://{_hostname}:{_https_port}/auth")
 KC_REALM = os.getenv("REALM", "opentdf")
 KC_USER = os.getenv("KC_USER", "top-secret-gbr-bbb")
 KC_PASS = os.getenv("PASSWORD", "testuser123")
 CLIENT_ID = 'secure-object-proxy-test'
 CLIENT_SECRET = 'secret'
 
-S4_STS_URL = "http://virtru-dsp-cop-dev-s4-1:7070"
-S4_S3_URL = "http://virtru-dsp-cop-dev-s4-1:7070" 
+_s4_port = os.getenv("S4_PORT", "7070")
+_s4_base = os.getenv("S4_ENDPOINT", f"https://s4:{_s4_port}")
+S4_STS_URL = _s4_base
+S4_S3_URL = _s4_base
 S4_BUCKET = "cop-demo"
 
 # --- DB Configs ---
 DB_NAME = "postgres"
 DB_USER = "postgres"
 DB_PASSWORD = "changeme"
-DB_HOST = "localhost"
-DB_PORT = 15432
+DB_HOST = os.getenv("DB_HOST", "cop-db")
+DB_PORT = int(os.getenv("DB_PORT", "5432"))
 
 # --- Authentication Logic ---
 

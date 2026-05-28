@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -28,20 +29,23 @@ func GetEntitlements(endpoint string, token string) (Entitlements, error) {
 	// add authorization header and content-type to the req
 	req.Header.Add("Authorization", "Bearer "+rawToken)
 	req.Header.Add("Content-Type", "application/json")
-	
+
+	slog.Debug("GetEntitlements request", slog.String("endpoint", endpoint))
+
 	//send request
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
+		slog.Error("GetEntitlements HTTP error", slog.String("endpoint", endpoint), slog.String("error", err.Error()))
 		return nil, err
 	}
 	defer resp.Body.Close()
-	data := &authorization.GetEntitlementsResponse{}
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
 	if resp.StatusCode == http.StatusOK {
-		bodyBytes, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return nil, err
-		}
+		data := &authorization.GetEntitlementsResponse{}
 		if err := protojson.Unmarshal(bodyBytes, data); err != nil {
 			return nil, err
 		}
@@ -52,7 +56,11 @@ func GetEntitlements(endpoint string, token string) (Entitlements, error) {
 			}
 		}
 		return entitlements, nil
-	} else {
-		return nil, fmt.Errorf("error getting entitlements: %d", resp.StatusCode)
 	}
+	slog.Error("GetEntitlements non-OK response",
+		slog.String("endpoint", endpoint),
+		slog.Int("status", resp.StatusCode),
+		slog.String("body", string(bodyBytes)),
+	)
+	return nil, fmt.Errorf("error getting entitlements: %d", resp.StatusCode)
 }
